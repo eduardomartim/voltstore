@@ -93,7 +93,9 @@ select throws_ok($$ select public.apply_checkout_event('evt_x', 'checkout.sessio
 -- ---------------------------------------------------------------------------
 set local request.jwt.claims = '{"sub":"33333333-3333-3333-3333-333333333333","role":"authenticated"}';
 
-select is((select count(*)::int from public.orders), 2, 'admin can read all orders');
+select is((select count(*)::int from public.orders
+           where user_id in ('11111111-1111-1111-1111-111111111111', '22222222-2222-2222-2222-222222222222')), 2,
+  'admin can read every customer''s orders');
 select is((select count(*)::int from public.products where slug = 'linea-slim-office-keyboard'), 1, 'admin can see inactive products');
 select is((select full_name from public.profiles where id = '22222222-2222-2222-2222-222222222222'), 'Bob',
   'the customer''s update of another profile had no effect');

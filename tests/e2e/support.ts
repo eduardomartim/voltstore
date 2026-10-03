@@ -52,11 +52,31 @@ export async function deleteProduct(slug: string) {
   await admin().from("products").delete().eq("slug", slug);
 }
 
+/**
+ * Deletes a test user's orders, first returning any stock they still hold
+ * (deleting order rows directly bypasses the restock-on-cancel trigger).
+ */
+export async function deleteUserOrders(userId: string) {
+  const client = admin();
+  const { data: orders } = await client
+    .from("orders")
+    .select("status, items:order_items(product_id, quantity)")
+    .eq("user_id", userId);
+  for (const order of orders ?? []) {
+    if (order.status === "cancelled") continue;
+    for (const item of order.items as { product_id: string | null; quantity: number }[]) {
+      if (!item.product_id) continue;
+      const { data: p } = await client.from("products").select("stock_quantity").eq("id", item.product_id).single();
+      if (p) await client.from("products").update({ stock_quantity: p.stock_quantity + item.quantity }).eq("id", item.product_id);
+    }
+  }
+  await client.from("orders").delete().eq("user_id", userId);
+}
+
 export async function deleteUser(user: TestUser | undefined) {
   if (!user) return;
-  const client = admin();
-  await client.from("orders").delete().eq("user_id", user.id);
-  await client.auth.admin.deleteUser(user.id);
+  await deleteUserOrders(user.id);
+  await admin().auth.admin.deleteUser(user.id);
 }
 
 /** Creates a pending order for a user the server way (service role + create_order). */

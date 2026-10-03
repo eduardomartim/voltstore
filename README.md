@@ -241,6 +241,7 @@ To promote any other user, run this in Studio's SQL editor: `update profiles set
    stripe listen --forward-to localhost:3000/api/webhooks/stripe --events checkout.session.completed,checkout.session.async_payment_succeeded,checkout.session.async_payment_failed,checkout.session.expired
    ```
    Put the printed `whsec_…` into `STRIPE_WEBHOOK_SECRET` and restart `npm run dev`.
+   The CLI must be logged in (`stripe login`) to the **same account or sandbox** that `STRIPE_SECRET_KEY` belongs to. Otherwise Checkout events go to a different account and the CLI sees nothing. `stripe listen` always forwards to the account it is authenticated with.
 3. Pay with test card `4242 4242 4242 4242`, any future date and any CVC. The success page switches to "confirmed" once the webhook arrives.
 
 In production, add an endpoint at `https://<your-domain>/api/webhooks/stripe` in the Stripe Dashboard for the same four events, and use that endpoint's signing secret.

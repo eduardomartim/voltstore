@@ -39,6 +39,18 @@ describe.skipIf(!enabled)("POST /api/webhooks/stripe (integration)", () => {
 
   afterAll(async () => {
     if (!userId) return;
+    // Return stock still held by this test's orders before deleting them
+    // (direct deletes bypass the restock-on-cancel trigger).
+    const { data: orders } = await admin
+      .from("orders")
+      .select("status, items:order_items(product_id, quantity)")
+      .eq("user_id", userId)
+      .neq("status", "cancelled");
+    const held = (orders ?? []).flatMap((o) => o.items).reduce((n, i) => n + i.quantity, 0);
+    if (held > 0) {
+      const { data: p } = await admin.from("products").select("stock_quantity").eq("id", product.id).single();
+      await admin.from("products").update({ stock_quantity: p!.stock_quantity + held }).eq("id", product.id);
+    }
     await admin.from("orders").delete().eq("user_id", userId);
     await admin.auth.admin.deleteUser(userId);
   });
