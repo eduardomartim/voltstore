@@ -85,6 +85,7 @@ export async function startCheckout(input: unknown): Promise<CheckoutResult> {
     return mapCreateOrderError(createError?.message ?? "");
   }
 
+  let createdSessionId: string | null = null;
   try {
     const { data: order, error: loadError } = await admin
       .from("orders")
@@ -111,6 +112,7 @@ export async function startCheckout(input: unknown): Promise<CheckoutResult> {
     );
 
     const session = await stripe.checkout.sessions.create(params, { idempotencyKey: `checkout-order-${order.id}` });
+    createdSessionId = session.id;
     if (!session.url) throw new Error("Stripe did not return a Checkout URL");
 
     const { error: updateError } = await admin
@@ -121,6 +123,16 @@ export async function startCheckout(input: unknown): Promise<CheckoutResult> {
 
     return { ok: true, url: session.url };
   } catch (error) {
+    // If Stripe already created a session, expire it so the customer cannot pay
+    // for an order we are about to cancel.
+    if (createdSessionId) {
+      await stripe.checkout.sessions.expire(createdSessionId).catch((expireError: unknown) =>
+        console.error("[checkout] failed to expire orphaned Checkout Session", {
+          orderId,
+          error: expireError instanceof Error ? expireError.message : String(expireError),
+        }),
+      );
+    }
     // Release the stock reserved for this order so it does not stay locked.
     await admin.rpc("release_pending_order", { p_order_id: orderId });
     console.error("[checkout] failed to create Stripe Checkout Session", {

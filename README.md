@@ -1,205 +1,257 @@
-# Voltline — full-stack e-commerce demo
+# VoltStore
 
-A small, production-minded tech store built as a portfolio project. It shows the parts of e-commerce that are easy to get wrong: authentication, **database-enforced authorization (PostgreSQL RLS)**, **server-side pricing**, **Stripe Checkout with signed, idempotent webhooks**, transactional email, and automated tests at three levels (unit, database, end-to-end).
+A full-stack e-commerce application for a fictional tech-accessories store, built with Next.js, Supabase and Stripe. The storefront is branded **Voltline**.
 
-> All products are fictional and payments run in Stripe **test mode**. Nothing is sold or shipped.
+This is a portfolio project. Products are fictional, payments run in **Stripe test mode**, and nothing is sold or shipped. The goal was not a large feature set. It was to get the parts of e-commerce that are easy to get wrong right, and to prove it with tests:
 
-**Stack:** Next.js 16 (App Router, Server Actions) · React 19 · TypeScript · Tailwind CSS 4 · shadcn/ui · Supabase (Postgres, Auth, RLS) · Stripe Checkout · Resend · Zod · Vitest · pgTAP · Playwright
+- who can read or change which data (enforced by PostgreSQL Row Level Security, not only by the UI)
+- what a customer pays (prices always come from the database, never from the browser)
+- when an order counts as paid (only when a verified Stripe webhook says so, processed exactly once)
+- that stock can't be oversold or left stuck in abandoned checkouts
 
 ---
 
-## Features
+## Overview
 
-**Store**
-- Homepage with featured products and categories
-- Catalog with search, category filters and sorting
-- Product pages with stock status; out-of-stock products can't be added
-- Cart (add, remove, change quantity, clear) with stock and quantity limits
-- Loading, empty, error and not-found states; responsive from phone to desktop
+Customers browse a catalog, build a cart, create an account and pay through Stripe Checkout. Payment confirmation arrives asynchronously through a Stripe webhook. That webhook is the single source of truth: it moves the order to `paid` and triggers the confirmation email. Administrators manage products, stock and the order fulfilment lifecycle from a protected admin area.
 
-**Accounts**
-- Sign up with email confirmation, sign in, sign out, persistent sessions
-- Password recovery and reset
-- Profile (editable name), order history and order details
-- Customers can only ever see their own data
+Most business rules that must never be violated live in PostgreSQL itself (transactions, row locks, constraints, triggers and RLS policies), so they hold no matter which code path touches the data.
 
-**Checkout and orders**
-- Stripe Checkout Session created on the server from database prices (BRL)
-- Stock is reserved when the order is created and released if checkout expires or fails
-- Payment is confirmed **only** by the verified Stripe webhook, never by the success redirect
-- The success page polls the order status the webhook writes
-- Order items store snapshots of name and unit price, so past orders never change
+## Key features
 
-**Admin** (role `admin`)
-- Dashboard: revenue, orders to fulfil, orders waiting for payment, low-stock list
-- Create and edit products, turn them on or off, change stock
-- View orders, filter by status, and move them through the lifecycle (the customer gets an email)
+**Storefront**
+- Product catalog with search, category filters and sorting
+- Product pages with live stock status; out-of-stock products can't be added to the cart
+- Cart: add, remove, change quantity, clear. Quantities are limited by stock and a per-item maximum.
+- Responsive layout, plus loading, empty, error and not-found states
 
-**Email** (Resend)
+**Accounts** (Supabase Auth)
+- Sign up with email confirmation, sign in, sign out, persistent cookie sessions
+- Password recovery and reset by email
+- Profile page, order history and order details, limited to the customer's own data
+
+**Checkout and payments** (Stripe)
+- A Stripe Checkout Session is created on the server from database prices, in BRL
+- Stock is reserved atomically when the order is created and released if checkout expires, fails or can't be started
+- Webhook-driven payment confirmation with signature verification and idempotent processing
+- A success page that shows the order state written by the webhook; arriving on the page doesn't confirm payment
+
+**Orders and inventory**
+- Orders store snapshots of product name and unit price, so later price changes never alter past orders
+- An order lifecycle enforced by the database: `pending → paid → processing → shipped → delivered`, with `cancelled` allowed before shipping
+- Cancelling an order puts its stock back automatically
+
+**Admin area** (role `admin`)
+- Dashboard: revenue from paid orders, orders to fulfil, orders awaiting payment, low-stock list
+- Create and edit products, activate or deactivate them, adjust stock
+- Browse and filter orders and advance their status; the customer is notified by email
+
+**Transactional email** (Resend)
 - Welcome email after the address is confirmed
 - Order confirmation when payment is received, payment-failed notice, and status updates
-- Without `RESEND_API_KEY`, emails are **logged and not sent**. The app never claims an email went out when it didn't.
+- Without an API key, emails are logged to the server console and reported as *not sent*
 
 ---
 
 ## Architecture
 
-A modular monolith. Each domain lives in its own module under `src/lib`, UI lives in `src/app` and `src/components`, and the database (schema, RLS and transactional functions) lives in `supabase/`.
+A modular monolith on the Next.js App Router. There are no separate backend services: server-side logic runs in Server Components, Server Actions and one API route, and the database enforces the critical rules.
+
+### Request flow
+
+```
+Browser
+  │
+  ▼
+Next.js App Router (src/proxy.ts refreshes the Supabase session cookie
+  │                and redirects anonymous users away from /account, /admin)
+  ├── Server Components ─────── read data with the user's own session
+  ├── Server Actions ────────── auth, cart pricing, checkout, profile, admin mutations
+  └── Route Handlers ────────── POST /api/webhooks/stripe · GET /auth/confirm
+  │
+  ▼
+Supabase
+  ├── Auth (email/password, confirmation and recovery emails)
+  └── PostgreSQL
+        ├── Row Level Security on every table
+        ├── column-level privileges
+        ├── SECURITY DEFINER functions: create_order, apply_checkout_event, release_pending_order
+        └── triggers: order-status guard, restock on cancel, profile creation, updated_at
+```
+
+Two Supabase clients are used deliberately:
+
+| Client | Key | Used for |
+|---|---|---|
+| Request-scoped server client (`src/lib/supabase/server.ts`) | anon key + the user's session cookie | Everything a user does, **including admin actions**, so RLS always applies |
+| Service-role client (`src/lib/supabase/admin.ts`, `server-only`) | service-role key | Only work no user may do directly: creating orders, applying webhook events, email bookkeeping |
+
+### Checkout and payment flow
+
+```
+Cart (browser stores only { productId, quantity })
+  │
+  ▼
+startCheckout  (Server Action)
+  ├─ require an authenticated user
+  ├─ validate the input with Zod (unknown fields such as a price are stripped)
+  └─ create_order()  ── one Postgres transaction:
+        lock product rows (FOR UPDATE) → check active and in stock →
+        reserve stock → insert order and item snapshots using DATABASE prices
+  │
+  ▼
+Stripe Checkout Session  (created on the server from the stored order;
+  │                       metadata.order_id, 30-minute expiry, idempotency key)
+  │   on any failure: expire the session and release the reserved stock
+  ▼
+Customer pays on Stripe's hosted page
+  │
+  ▼
+POST /api/webhooks/stripe
+  ├─ read the raw body and verify the Stripe-Signature header (invalid → 400)
+  ├─ map checkout.session.completed / async_payment_succeeded / async_payment_failed / expired
+  └─ apply_checkout_event()  ── one Postgres transaction:
+        record event id in webhook_events (already seen → "duplicate", stop)
+        lock the order → check amount_total and currency against the order
+        guarded transition: pending → paid   (or cancel and release stock on failure or expiry)
+  │
+  ▼
+Confirmation email, sent only on a fresh transition and at most once per order
+  │
+  ▼
+/checkout/success polls the order and shows the state the webhook wrote
+```
+
+If the database write fails, the transaction, including the event-ledger row, rolls back and the route returns `500`, so Stripe retries the event.
+
+---
+
+## Security architecture
+
+| Area | What is implemented |
+|---|---|
+| **Authentication** | Supabase Auth with `@supabase/ssr` cookie sessions (PKCE). The server identifies users with `auth.getUser()`, which is validated by the Auth server. Sign-up and password reset return the same response whether or not the email exists. |
+| **Authorization** | Checked in three independent places: page-level guards, `assertAdmin()` in every admin Server Action, and RLS in Postgres. Admin pages check the role themselves, because layouts and pages render in parallel. |
+| **Row Level Security** | Enabled on every table, with table and column privileges revoked first. Customers read only their own profile, orders and order items, and can update only their own `full_name`. Admins can update only the order `status` column, never money fields. No user can insert orders, change roles or touch `webhook_events`. |
+| **Business rules in the database** | A trigger rejects invalid status changes for everyone, including admins; for example, nobody can ship an order that isn't paid. `CHECK` constraints cover prices, stock, quantities and line totals. |
+| **Server-side pricing** | Totals are computed inside `create_order()` from the `products` table. The webhook also refuses to mark an order paid if Stripe's amount or currency differs. |
+| **Webhook integrity** | Signature verified on the raw body with `STRIPE_WEBHOOK_SECRET`; event ids are recorded in a ledger inside the same transaction; transitions are guarded so duplicate or out-of-order events are harmless. |
+| **Server-only secrets** | Secret keys are read only in modules marked `import "server-only"`; the service-role client can't be bundled for the browser. |
+| **Input validation** | Every Server Action parses its input with Zod. Search terms are cleaned before use in PostgREST filters, and image URLs must be `https` URLs from an allowlisted host. |
+| **Redirects** | `safeNextPath()` accepts only same-origin relative paths, which blocks open redirects through `?next=`. Stripe return URLs are built from `NEXT_PUBLIC_SITE_URL`, not from request headers. |
+| **XSS** | React escaping and no `dangerouslySetInnerHTML`. Email templates HTML-escape all dynamic values. |
+| **Error handling** | Users see generic messages; details are logged on the server only. The global error page never renders `error.message`. |
+| **Abuse limits** | At most 3 pending orders per customer, so stock can't be hoarded by abandoned checkouts. Supabase Auth applies its own rate limits. |
+| **HTTP headers** | `X-Frame-Options: DENY`, `X-Content-Type-Options`, `Referrer-Policy`, `Permissions-Policy` and HSTS are set; `X-Powered-By` is turned off. |
+
+---
+
+## Tech stack
+
+| Layer | Technology |
+|---|---|
+| Framework | Next.js 16 (App Router, Server Actions, Turbopack), React 19, TypeScript 5 |
+| UI | Tailwind CSS 4, shadcn/ui components on Radix UI, lucide-react icons, sonner toasts |
+| Backend and data | Supabase (Auth and PostgreSQL), `@supabase/ssr`, `@supabase/supabase-js` |
+| Payments | Stripe Checkout and webhooks (`stripe` Node SDK v23) |
+| Email | Resend |
+| Validation | Zod 4 |
+| Testing | Vitest (unit and integration), pgTAP via the Supabase CLI (database), Playwright (end-to-end) |
+| Tooling | ESLint, Prettier, Supabase CLI (local stack and migrations) |
+
+## Project structure
 
 ```
 src/
-  app/                     Routes (App Router)
-    api/webhooks/stripe/   Stripe webhook (raw body + signature check)
-    auth/confirm/          Landing route for auth email links
-    account/  admin/  cart/  checkout/success/  products/ …
-  components/              UI (shadcn/ui primitives in components/ui)
-  lib/
-    auth/                  Session helpers, auth Server Actions
-    admin/                 Admin queries and Server Actions
-    cart/                  Pure cart logic (shared by client and server)
-    checkout/              Checkout Server Actions
-    stripe/                Stripe client, session builder, webhook processor
-    email/                 Resend client, templates, notifications
-    orders/                Order queries, status model
-    supabase/              Server client, service-role client, proxy session refresh
-    validation/            Zod schemas
-    security/              Safe-redirect helper
-  proxy.ts                 Refreshes the session and redirects anonymous users (Next 16 "proxy")
+├── app/                        App Router routes
+│   ├── api/webhooks/stripe/    Stripe webhook (signature check, idempotent processing)
+│   ├── auth/confirm/           Landing route for auth email links (confirmation and recovery)
+│   ├── products/  cart/  checkout/success/
+│   ├── account/                Profile and order history (signed-in users)
+│   ├── admin/                  Dashboard, products and orders (admins)
+│   └── sign-in/  sign-up/  forgot-password/  reset-password/
+├── components/                 UI; components/ui holds the shadcn/ui primitives
+├── lib/
+│   ├── auth/                   Session helpers and auth Server Actions
+│   ├── admin/                  Admin queries and Server Actions
+│   ├── cart/                   Pure cart logic shared by client and server
+│   ├── checkout/               Checkout Server Actions
+│   ├── stripe/                 Stripe client, Checkout Session builder, webhook processor
+│   ├── email/                  Resend sender, templates, notifications
+│   ├── orders/                 Order queries and status model
+│   ├── supabase/               Server, service-role and proxy clients
+│   ├── validation/             Zod schemas
+│   ├── security/               Safe-redirect helper
+│   └── types/database.ts       Types generated from the database schema
+└── proxy.ts                    Session refresh and redirects for protected routes (Next 16 "proxy")
 supabase/
-  migrations/              Schema, constraints, indexes, RLS, SQL functions
-  seed.sql                 Demo catalog
-  tests/database/          pgTAP tests for RLS and business rules
-scripts/seed-users.mts     Creates demo admin/customer accounts
+├── migrations/                 Schema, constraints, indexes, RLS, SQL functions and triggers
+├── seed.sql                    Demo catalog (15 fictional products)
+├── tests/database/             pgTAP tests for RLS and business rules
+└── config.toml                 Local Supabase configuration
+scripts/seed-users.mts          Creates the demo admin and customer accounts
 tests/
-  unit/                    Vitest unit tests
-  integration/             Webhook route against the real local database
-  e2e/                     Playwright end-to-end tests
+├── unit/                       Vitest unit tests
+├── integration/                Webhook route against the real local database
+└── e2e/                        Playwright end-to-end tests
 ```
 
-**Key decisions**
-- **Business rules that must hold live in Postgres.** Creating an order (pricing, stock locking and reservation), applying a payment, and allowed status changes are SQL functions and triggers, so concurrency is handled by transactions and row locks rather than application code.
-- **Two Supabase clients.** Normal reads and writes use the *user's* session, so RLS applies, and that includes admin actions. The service-role client is only used in `server-only` modules for work no user may do directly: creating orders, applying webhooks, and email bookkeeping.
-- **The cart stays on the client.** The browser stores only `{productId, quantity}` in `localStorage`. Prices are always fetched from the server and re-checked at checkout, so tampering with storage changes nothing (an E2E test covers this). This avoids cart tables and guest-cart merging.
-- **No shipping or address step.** Shipping is free and the total equals the subtotal, which keeps the model small and the demo focused.
-
 ---
 
-## Authentication
+## Getting started
 
-Supabase Auth with `@supabase/ssr` cookie sessions (PKCE flow).
+### Prerequisites
+- Node.js 20.9 or later (developed on Node 24) and npm
+- Docker, to run Supabase locally
+- Optional: a Stripe account (test mode), the [Stripe CLI](https://docs.stripe.com/stripe-cli) and a Resend account
 
-- Sign up, sign in, reset and profile updates are Server Actions validated with Zod.
-- Links in auth emails go to `/auth/confirm`. It accepts both `code` (PKCE) and `token_hash`, sets up the session, sends the welcome email once, and redirects only to same-origin paths (`safeNextPath` blocks open redirects).
-- `src/proxy.ts` refreshes the session on every request and sends anonymous users from `/account` and `/admin` to sign in. This is a convenience, **not** the security boundary.
-- Server code identifies the user with `supabase.auth.getUser()`, which is validated by the Auth server, not with unverified cookie data.
-- Sign-up and password-reset responses don't reveal whether an email is registered.
+### 1. Clone and install
 
-## Authorization and Row Level Security
+```bash
+git clone https://github.com/eduardomartim/voltstore.git
+```
 
-Roles are `customer` (the default, set by a trigger on `auth.users`) and `admin` (`profiles.role`). Authorization is enforced at three independent layers:
-
-1. **UI:** the admin layout and pages check the role. Each admin page checks it again, because layouts and pages render in parallel.
-2. **Server Actions:** every admin mutation calls `assertAdmin()` first.
-3. **Postgres:** RLS is enabled on every table, and table and column privileges are cut back first.
-
-| Table | anon | customer | admin |
-|---|---|---|---|
-| `products` | read active | read active | read all, insert, update (catalog columns only) |
-| `categories` | read | read | read |
-| `profiles` | — | read and update **own** row, `full_name` column only | read all |
-| `orders` | — | read **own** | read all, update the **`status` column only** |
-| `order_items` | — | read items of own orders | read all |
-| `webhook_events` | — | — | — (service role only) |
-
-- Nobody can insert orders from the client. Orders are created only by `create_order()`, which only the service role may execute.
-- `is_admin()` is a `SECURITY DEFINER` helper so policies don't recurse.
-- A trigger (`guard_order_status_change`) enforces the lifecycle for everyone, admins included: `pending → paid → processing → shipped → delivered`, with `cancelled` allowed before shipping. An order **can't be fulfilled unless `payment_status = 'paid'`**, and only the webhook can set that.
-- Cancelling an order puts its stock back (trigger).
-
-These rules are covered by the pgTAP suite in `supabase/tests/database/rls.test.sql`.
-
-## Stripe integration
-
-1. The client sends `{ items: [{ productId, quantity }] }` to the `startCheckout` Server Action. Any client-sent price is ignored, and Zod strips unknown keys.
-2. The server checks the session and input, then calls `create_order()`. Inside one transaction it locks the product rows (`FOR UPDATE`), checks that each product is active and in stock, reserves stock, and writes the order and item snapshots using **database prices**. It also caps each customer at 3 pending orders, so nobody can hoard stock.
-3. A Checkout Session is created from the stored order (BRL, `metadata.order_id`, `client_reference_id`, 30-minute expiry, idempotency key per order). If Stripe fails, the reservation is released at once.
-4. The customer pays on Stripe and comes back to `/checkout/success?session_id=…`. That page **only displays** the state stored in the database.
-
-## Webhook architecture
-
-`POST /api/webhooks/stripe`:
-- Reads the **raw body** (`request.text()`) and checks `Stripe-Signature` with `STRIPE_WEBHOOK_SECRET`. Invalid or missing signatures get `400`.
-- Handles `checkout.session.completed` (only when `payment_status = paid`), `checkout.session.async_payment_succeeded`, `async_payment_failed` and `expired`.
-- Calls `apply_checkout_event()`, which in **one transaction**:
-  - inserts the event id into `webhook_events`. If it already exists the result is `duplicate` and nothing else happens.
-  - locks the order and applies a guarded change (only `pending → paid`), so even two *different* events for the same session can't fulfil an order twice.
-  - checks that `amount_total` and `currency` match the order (otherwise `amount_mismatch`, and the order is not marked paid).
-  - on failure or expiry, cancels the order and releases its stock.
-- Emails are sent only when the database reports a fresh change. The order confirmation is also "claimed" with a conditional update on `confirmation_email_sent_at`, so it goes out at most once.
-- If the database write fails, the transaction (ledger row included) rolls back and the route returns `500`, so Stripe retries. An email failure after a committed payment is logged and does not cause a retry.
-
-## Database overview
-
-`profiles`, `categories`, `products`, `orders`, `order_items`, `webhook_events`. The schema includes:
-- Integer money in centavos and `CHECK` constraints (positive prices, non-negative stock, quantity 1–10, `subtotal = unit × qty`, paid orders must have `paid_at`, `currency = 'brl'`, slug format, https image URLs)
-- Foreign keys, unique slugs, a unique Stripe session id, a human-readable `order_number` identity (shown as `VL-1001`)
-- Indexes for catalog listing, per-user order history and status filters
-- `updated_at` triggers
-
-## Security considerations
-
-| Concern | Mitigation |
-|---|---|
-| Secret exposure | Secrets are read only in `server-only` modules. No `NEXT_PUBLIC_` secrets. The built client bundle was scanned for the service key and secret variable names. |
-| Price or total tampering | Prices come only from the DB inside `create_order()`. The webhook re-checks the amount. |
-| IDOR | RLS on orders and order items, plus an explicit ownership check on the customer order page. Tested in pgTAP and E2E. |
-| Privilege escalation | Customers can't update `role` (column privileges). Admin mutations are checked in the action **and** by RLS. |
-| Webhook forgery or replay | Signature check (with Stripe's timestamp tolerance), event-id ledger, guarded state changes |
-| SQL / filter injection | Parameterized queries through supabase-js. The search term is cleaned before use in PostgREST `or()` filters. |
-| XSS | React escaping, no `dangerouslySetInnerHTML`. Email templates HTML-escape all dynamic text. Product images are restricted to an allowlisted host. |
-| Open redirects | `safeNextPath` on sign-in and auth callbacks. Stripe redirect URLs are built from `NEXT_PUBLIC_SITE_URL`, never from request headers. |
-| Error leakage | Server Actions return generic messages, and details are logged on the server only. `error.tsx` never renders `error.message`. |
-| Headers | `X-Frame-Options`, `X-Content-Type-Options`, `Referrer-Policy`, `Permissions-Policy`, HSTS, no `X-Powered-By` |
-
----
-
-## Testing
-
-| Suite | Command | What it covers |
-|---|---|---|
-| Unit (Vitest) | `npm test` | Cart maths and limits, normalizing tampered cart storage, Zod schemas, price parsing, safe redirects, search cleanup, Checkout Session params, mapping webhook events, idempotent processing, Stripe signature checks, order lifecycle, email escaping |
-| Integration (Vitest) | `npm test` | The real webhook route against local Postgres: rejects bad signatures, reserves stock, marks paid exactly once across redeliveries (one email), ignores mismatched amounts, restocks on expiry. Skipped if Supabase env vars are missing. |
-| Database (pgTAP) | `npm run test:db` | RLS for anon, customer and admin; no self-promotion; no direct order inserts or RPC calls; DB-computed totals; out-of-stock rejection; pending-order cap; no shipping unpaid orders; webhook idempotency |
-| End-to-end (Playwright) | `npm run test:e2e` | Store, search and filters, product page, out-of-stock, 404, cart, cart tampering, sign-up with **real email confirmation link**, **password recovery via email**, sign in/out, session persistence, open-redirect block, protected routes, IDOR, customer blocked from admin, admin product CRUD, stock and activation, admin order lifecycle, checkout start, forged success page, mobile layout |
-
-The E2E email tests read the local Supabase inbox (Mailpit). If `STRIPE_SECRET_KEY` is set, the checkout test expects a redirect to `checkout.stripe.com`. Otherwise it expects the "payments unavailable" message, and in that case no order is created.
-
----
-
-## Local setup
-
-**Requirements:** Node.js 20.9+ (developed on Node 24), npm, and Docker (for local Supabase).
+```bash
+cd voltstore
+```
 
 ```bash
 npm install
 ```
 
+### 2. Start Supabase locally
+
 ```bash
 npx supabase start
 ```
+
+This starts Postgres, Auth, Studio (http://127.0.0.1:54323) and a local inbox for auth emails (http://127.0.0.1:54324). Then apply the migrations and seed the catalog:
+
+```bash
+npm run db:reset
+```
+
+### 3. Configure environment variables
 
 ```bash
 cp .env.example .env.local
 ```
 
-Fill in `.env.local`:
-- `NEXT_PUBLIC_SUPABASE_ANON_KEY` and `SUPABASE_SERVICE_ROLE_KEY`: copy them from `npx supabase status`
-- `DEMO_ADMIN_PASSWORD` and `DEMO_CUSTOMER_PASSWORD`: choose any local passwords
-- Stripe and Resend keys: optional (see below)
+Fill in `.env.local`. Never commit it; it is already ignored by Git.
 
-```bash
-npm run db:reset
-```
+| Variable | Required | Purpose |
+|---|---|---|
+| `NEXT_PUBLIC_SITE_URL` | yes | Base URL used for Stripe redirects and auth email links |
+| `NEXT_PUBLIC_SUPABASE_URL` | yes | Supabase API URL (shown by `npx supabase status`) |
+| `NEXT_PUBLIC_SUPABASE_ANON_KEY` | yes | Public anon key, protected by RLS |
+| `SUPABASE_SERVICE_ROLE_KEY` | yes | Server-only; bypasses RLS |
+| `STRIPE_SECRET_KEY` | for checkout | Stripe test-mode secret key |
+| `STRIPE_WEBHOOK_SECRET` | for webhooks | Signing secret printed by `stripe listen` (or from the Dashboard endpoint) |
+| `RESEND_API_KEY` | optional | Without it, emails are logged instead of sent |
+| `EMAIL_FROM` | optional | Sender address |
+| `DEMO_ADMIN_EMAIL`, `DEMO_ADMIN_PASSWORD`, `DEMO_CUSTOMER_EMAIL`, `DEMO_CUSTOMER_PASSWORD` | for `seed:users` | Local demo accounts; choose your own passwords |
+
+### 4. Create the demo accounts and run
 
 ```bash
 npm run seed:users
@@ -209,70 +261,63 @@ npm run seed:users
 npm run dev
 ```
 
-Open http://localhost:3000. Auth emails (confirmation and reset) are caught by the local inbox at http://127.0.0.1:54324. Supabase Studio is at http://127.0.0.1:54323.
+Open http://localhost:3000. Sign in with the demo admin account to reach `/admin`. Accounts you create through sign-up are customers; promote one with SQL if needed: `update profiles set role = 'admin' where email = '…';`
 
-### Demo accounts
+### Stripe local development
 
-`npm run seed:users` creates (or resets) two confirmed accounts from your `.env.local`:
-- **Admin:** `DEMO_ADMIN_EMAIL` / `DEMO_ADMIN_PASSWORD`. Opens `/admin`.
-- **Customer:** `DEMO_CUSTOMER_EMAIL` / `DEMO_CUSTOMER_PASSWORD`
-
-To promote any other user, run this in Studio's SQL editor: `update profiles set role = 'admin' where email = '…';`
-
-### Environment variables
-
-| Variable | Required | Notes |
-|---|---|---|
-| `NEXT_PUBLIC_SITE_URL` | yes | Base URL for Stripe redirects and auth email links |
-| `NEXT_PUBLIC_SUPABASE_URL` | yes | |
-| `NEXT_PUBLIC_SUPABASE_ANON_KEY` | yes | Public key, protected by RLS |
-| `SUPABASE_SERVICE_ROLE_KEY` | yes | **Server only.** Bypasses RLS. |
-| `STRIPE_SECRET_KEY` | for checkout | Test-mode key (`sk_test_…`) |
-| `STRIPE_WEBHOOK_SECRET` | for webhooks | `whsec_…` |
-| `RESEND_API_KEY` | optional | Without it, emails are logged and not sent |
-| `EMAIL_FROM` | optional | Defaults to `Voltline <onboarding@resend.dev>` |
-| `DEMO_*` | for `seed:users` | Local demo accounts |
-
-### Stripe setup
-
-1. Create a Stripe account, stay in **test mode**, and copy the secret key into `STRIPE_SECRET_KEY`.
-2. Forward webhooks locally with the [Stripe CLI](https://docs.stripe.com/stripe-cli):
+1. Put your **test-mode** secret key in `STRIPE_SECRET_KEY`.
+2. Log the Stripe CLI in to the **same account or sandbox** that `STRIPE_SECRET_KEY` belongs to. `stripe listen` only receives events from the account it is authenticated with. If the two differ, Checkout succeeds but no webhook ever arrives.
    ```bash
-   stripe listen --forward-to localhost:3000/api/webhooks/stripe --events checkout.session.completed,checkout.session.async_payment_succeeded,checkout.session.async_payment_failed,checkout.session.expired
+   stripe login
    ```
-   Put the printed `whsec_…` into `STRIPE_WEBHOOK_SECRET` and restart `npm run dev`.
-   The CLI must be logged in (`stripe login`) to the **same account or sandbox** that `STRIPE_SECRET_KEY` belongs to. Otherwise Checkout events go to a different account and the CLI sees nothing. `stripe listen` always forwards to the account it is authenticated with.
-3. Pay with test card `4242 4242 4242 4242`, any future date and any CVC. The success page switches to "confirmed" once the webhook arrives.
+3. Forward the events the app handles to the webhook route:
+   ```bash
+   stripe listen --events checkout.session.completed,checkout.session.async_payment_succeeded,checkout.session.async_payment_failed,checkout.session.expired --forward-to localhost:3000/api/webhooks/stripe
+   ```
+4. Copy the `whsec_…` value it prints into `STRIPE_WEBHOOK_SECRET` and restart `npm run dev`.
+5. Pay with test card `4242 4242 4242 4242`, any future expiry date and any CVC. The success page switches to "confirmed" once the webhook has been processed.
 
-In production, add an endpoint at `https://<your-domain>/api/webhooks/stripe` in the Stripe Dashboard for the same four events, and use that endpoint's signing secret.
+To replay an existing event, for example while debugging: `stripe events resend <event_id>`. In a deployed environment, register `https://<your-domain>/api/webhooks/stripe` in the Stripe Dashboard for the same four events and use that endpoint's signing secret.
 
-### Resend setup
+### Resend
 
-Create an API key at resend.com and set `RESEND_API_KEY`. `onboarding@resend.dev` can only send to your own Resend account email. To email other people, verify a domain and set `EMAIL_FROM`. Password-reset and confirmation emails are sent by Supabase Auth itself (configure SMTP in Supabase for production).
+Set `RESEND_API_KEY`. With the default sender `onboarding@resend.dev`, Resend only delivers to the email address of your own Resend account. To send to other recipients, verify a domain and set `EMAIL_FROM`. Sign-up confirmation and password-reset emails are sent by Supabase Auth, not Resend.
 
-### Supabase (hosted) setup
+---
 
-1. Create a project and link it: `npx supabase link --project-ref <ref>`.
-2. Push the schema: `npx supabase db push`. Then load the catalog by running `supabase/seed.sql` in the SQL editor.
-3. In **Auth → URL Configuration**, set the Site URL and add `https://<your-domain>/**` to the redirect URLs. Keep email confirmations on.
-4. Copy the project URL, anon key and service-role key into your deployment's environment variables.
+## Testing
 
-## Deployment
+| Command | Suite | What it covers |
+|---|---|---|
+| `npm test` | Vitest: 77 unit tests and 5 integration tests | Cart maths and limits, rejection of tampered cart data, Zod schemas, BRL price parsing, open-redirect protection, search-term cleaning, Checkout Session parameters, webhook event mapping and idempotency, Stripe signature verification, order lifecycle rules, HTML escaping in emails. **Integration:** the real webhook route against local Postgres: bad signatures rejected, stock reserved, order paid exactly once across redeliveries (one email), amount mismatch refused, expiry releases stock. |
+| `npm run test:db` | pgTAP: 27 assertions | RLS for anonymous, customer and admin users; no self-promotion to admin; no direct order inserts or calls to privileged functions; totals computed by the database; out-of-stock rejection; pending-order cap; no shipping unpaid orders; webhook idempotency |
+| `npm run test:e2e` | Playwright: 24 tests (desktop and mobile) | Catalog, search and filters, product pages, cart, cart tampering, sign-up with a **real email confirmation link**, **password recovery by email**, sessions, protected routes, open-redirect blocking, access to another customer's order (IDOR), customer blocked from admin, admin product and stock management, admin order lifecycle, checkout start (redirect to Stripe when keys are configured), forged success page, mobile layout |
+| `npm run lint` / `npm run typecheck` / `npm run build` | Static checks | ESLint, TypeScript, production build |
 
-The app is a standard Next.js app (for example on Vercel). Set every environment variable above (with `NEXT_PUBLIC_SITE_URL` as your production URL), register the Stripe webhook endpoint, and deploy. `npm run build && npm start` runs it on any Node host.
+The integration, database and end-to-end suites need the local Supabase stack running. The E2E email tests read the local inbox, so the app must be reachable at `NEXT_PUBLIC_SITE_URL`.
 
-## Scripts
+## Security notes
 
-`dev` · `build` · `start` · `lint` · `typecheck` · `test` · `test:e2e` · `test:db` · `db:reset` · `db:types` (regenerate `src/lib/types/database.ts`) · `seed:users` · `format`
+- All secrets come from environment variables. `.env*` files are ignored by Git, except `.env.example`, which contains only placeholders.
+- `SUPABASE_SERVICE_ROLE_KEY`, `STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET` and `RESEND_API_KEY` are only read on the server. Never prefix them with `NEXT_PUBLIC_`.
+- Use Stripe **test-mode** keys for this project.
 
 ## Known limitations
 
-- No shipping address, tax or shipping cost. The total equals the subtotal.
-- Refunds aren't automated. `payment_status = refunded` exists in the model, but nothing sets it yet. Refunds would be issued in the Stripe Dashboard.
-- A payment that arrives after its order was cancelled (a rare race with session expiry) is recorded as paid on the cancelled order and logged for manual review. It isn't fulfilled automatically.
-- If a confirmation email fails after payment, it's logged and not retried automatically.
-- The cart lives in `localStorage` per browser. It doesn't follow a user between devices.
-- Product images must come from `images.unsplash.com` (no upload pipeline). Categories are managed through the seed or SQL, not the admin UI.
-- There is no app-level rate limiting beyond Supabase Auth's limits and the pending-order cap. There is no Content-Security-Policy header.
-- Unknown product URLs render the not-found page with an HTTP 200 status, because Next.js has already started streaming the page (the page is marked `noindex`).
-- End-to-end payment through Stripe's hosted page isn't automated in CI. The webhook path is covered by integration tests with signed events.
+- No shipping address, tax or shipping cost; the order total equals the subtotal.
+- Refunds aren't automated. The `refunded` payment status exists in the schema, but nothing sets it; refunds would be issued in the Stripe Dashboard.
+- A payment that arrives after its order was cancelled (a rare race with session expiry) is recorded and logged for manual review; it isn't fulfilled automatically.
+- If an email fails to send after a successful payment, the failure is logged but not retried.
+- The cart lives in the browser's `localStorage` and doesn't follow a user across devices.
+- Product images must be URLs from `images.unsplash.com`; there is no upload pipeline. Categories are managed through the seed file or SQL, not the admin UI.
+- No application-level rate limiting beyond Supabase Auth's limits and the pending-order cap, and no Content-Security-Policy header.
+- Unknown product URLs render the not-found page with HTTP status 200, because Next.js has already started streaming the response; the page is marked `noindex`.
+- Paying on Stripe's hosted page isn't automated in the test suite. The webhook path is covered by integration tests with signed events.
+
+## Portfolio notes
+
+VoltStore is a demonstration project written to show engineering decisions rather than breadth of features: correctness and security rules enforced at the database layer, server-side trust boundaries, idempotent payment processing, and tests at the unit, database and browser level. All products, prices and accounts are fictional.
+
+## Author
+
+**Eduardo Martim** · [github.com/eduardomartim](https://github.com/eduardomartim)
