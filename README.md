@@ -12,6 +12,7 @@ This is a portfolio project. The goal was not a large feature set. It was to get
 - **that stock is consistent**: it can't be oversold or left stuck in abandoned checkouts
 
 ---
+<img width="1920" height="1080" alt="Captura de tela 2026-10-06 202508" src="https://github.com/user-attachments/assets/d18e21d2-810d-4fe6-8ac4-09943e9fc168" />
 
 ## Contents
 
